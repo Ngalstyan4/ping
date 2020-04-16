@@ -16,6 +16,7 @@
 #include <math.h>
 
 #define ICMP_HEADER_SIZE 8
+#define IP_HEADER_SIZE  20
 typedef struct RTT_time {
     //// times in millis
     float min;
@@ -47,36 +48,37 @@ void sigint_print_stats(int sig_num);
 
 u_short icmp_checksum(char *packet, int len);
 
+int icmp_is_valid_reply(char *packet);
+
 void print_usage();
 
 int main(int argc, char **argv) {
-    char packet[64];
+    // 20(ip header) + 8(ICMP header) + 16(timestamp)
+    char packet[sizeof(struct ip) + ICMP_HEADER_SIZE + sizeof(struct timeval)];
 
-    // for sending packets
+    // for time data in sent and received packets
     struct sockaddr whereto;
     socklen_t whereto_len;
-
-    // for received packets
     struct sockaddr wherefrom;
     socklen_t wherefrom_len = sizeof(wherefrom);
-
-    // general var for functions that return int/status
-    int status;
-    int sockfd;
-
-    // seconds to wait after each request
-    unsigned int interrequest_wait = 1;
 
     // timeout in (seconds, useconds)
     // initial value relevant only for the first packet
     // then it is updated to 2*RTT //todo
     struct timeval recv_timeout = {1, 0};
-    int seq_num = 0;
+    // seconds to wait after each request
+    unsigned int interrequest_wait = 1;
+
+    // general var for functions that return int/status
+    int status;
+    int sockfd;
+    int seq_num;
 
     if (argc < 2 || argc > 2) {
         print_usage();
         exit(1);
     }
+
     ICMP_ID = getpid() & 0xffff;
     host = argv[1];
 
@@ -119,17 +121,17 @@ int main(int argc, char **argv) {
             //printf("receiving in header: %u , seq-1: %u", icmp_header->icmp_seq, seq_num-1);
         } while (status != -1 && icmp_header->icmp_seq < seq_num - 1);
 
-        if (status != -1 && icmp_header->icmp_id == ICMP_ID) {
+        if (status != -1 && icmp_is_valid_reply((char *) icmp_header) != -1) {
             float rtt;
             struct timeval *send_time_in_data = (struct timeval *) (packet + sizeof(struct ip) + ICMP_HEADER_SIZE);
 
             nreceived++;
             rtt = update_stats(&rtt_time_stats, &recv_time, send_time_in_data);
+
             if (rtt_time_stats.cnt == 3) {
                 /* improvising here:
                  * Wait some time to accumulate data then update recv_time
-                 * */
-
+                 */
                 memset(&recv_timeout, 0, sizeof(recv_timeout));
                 // TIMEOUT = 2*RTT
                 recv_timeout.tv_usec = 2 * rtt_time_stats.sum * 1000.0 / rtt_time_stats.cnt;
@@ -141,11 +143,9 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "Request timeout for icmp_seq %u\n", seq_num - 1);
         }
+
         sleep(interrequest_wait);
-
     }
-
-
 }
 
 /* Initiates a raw socket and returns a valid socket or exits the program with an error message */
@@ -208,7 +208,6 @@ int compose_packet(char *packet, u_short seq_num, struct timeval *send_time) {
     return ICMP_HEADER_SIZE + sizeof(struct timeval);
 }
 
-
 float update_stats(struct RTT_time *rtt_time_stats, struct timeval *recv_time, struct timeval *send_time_in_data) {
     float rtt;
     rtt = recv_time->tv_sec - send_time_in_data->tv_sec;
@@ -240,7 +239,6 @@ void sigint_print_stats(int sig_num) {
     exit(0);
 }
 
-
 // https://tools.ietf.org/html/rfc1071
 // Computing the Internet Checksum
 // Algorithm described in RFC1071
@@ -270,6 +268,20 @@ u_short icmp_checksum(char *packet, int len) {
     checksum = ~sum;
     return checksum;
 }
+
+int icmp_is_valid_reply(char *packet) {
+    u_short checksum;
+    struct icmp *icmp_header = (struct icmp *) packet;
+    if (icmp_header->icmp_type != ICMP_ECHOREPLY) return -1;
+    if (icmp_header->icmp_id != ICMP_ID) return -1;
+
+    checksum = icmp_header->icmp_cksum;
+    icmp_header->icmp_cksum = 0;
+    icmp_header->icmp_cksum = icmp_checksum(packet, ICMP_HEADER_SIZE + sizeof(struct timeval));
+    if (icmp_header->icmp_cksum != checksum) return -1;
+    return 0;
+}
+
 
 void print_usage() {
     fprintf(stderr, "usage: ./ping host\n\n");
