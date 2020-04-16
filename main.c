@@ -38,19 +38,19 @@ u_short ICMP_ID;
 
 /***************************** DANGER ZONE END ********************************/
 
-int init_socket(struct timeval *recv_timeout, struct sockaddr *whereto, socklen_t *whereto_len);
+int init_socket(int ip_ttl, struct timeval *recv_timeout, struct sockaddr *whereto, socklen_t *whereto_len);
 
 int compose_packet(char *packet, u_short seq_num, struct timeval *send_time);
 
 float update_stats(struct RTT_time *rtt_time_stats, struct timeval *recv_time, struct timeval *send_time_in_data);
 
-void sigint_print_stats(int sig_num);
+void exit_with_stats(int sig_num);
 
 u_short icmp_checksum(char *packet, int len);
 
 int icmp_is_valid_reply(char *packet);
 
-void print_usage();
+void parse_args(int argc, char **argv, int *ttl, int *timeout, int *count);
 
 int main(int argc, char **argv) {
     // 20(ip header) + 8(ICMP header) + 16(timestamp)
@@ -74,18 +74,20 @@ int main(int argc, char **argv) {
     int sockfd;
     int seq_num;
 
-    if (argc < 2 || argc > 2) {
-        print_usage();
-        exit(1);
-    }
+    int ip_ttl = -1;
+    int timeout = -1;
+    int count = -1;
+
+    parse_args(argc, argv, &ip_ttl, &timeout, &count);
 
     ICMP_ID = getpid() & 0xffff;
-    host = argv[1];
-
-    sockfd = init_socket(&recv_timeout, &whereto, &whereto_len);
+    sockfd = init_socket(ip_ttl, &recv_timeout, &whereto, &whereto_len);
 
     printf("myPING %s (%s):\n", host, inet_ntoa(((struct sockaddr_in *) &whereto)->sin_addr));
-    signal(SIGINT, sigint_print_stats);
+    // handle cmd+c to print stats before exit
+    signal(SIGINT, exit_with_stats);
+    signal(SIGALRM, exit_with_stats);
+    if (timeout != -1) alarm(timeout);
 
     seq_num = 0;
     for (;;) {
@@ -138,18 +140,20 @@ int main(int argc, char **argv) {
                 setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &recv_timeout, sizeof(recv_timeout));
             }
 
-            printf("received icmp packet of %d bytes from %s, icmp_seq=%u time=%.3fms \n", status,
-                   inet_ntoa(((struct sockaddr_in *) &wherefrom)->sin_addr), icmp_header->icmp_seq, rtt);
+            printf("received icmp packet of %d bytes from %s, icmp_seq=%u, ttl=%u, time=%.3fms \n", status,
+                   inet_ntoa(((struct sockaddr_in *) &wherefrom)->sin_addr), icmp_header->icmp_seq, ip_header->ip_ttl,
+                   rtt);
         } else {
             fprintf(stderr, "Request timeout for icmp_seq %u\n", seq_num - 1);
         }
 
+        if (count != -1 && nreceived >= count) exit_with_stats(0);
         sleep(interrequest_wait);
     }
 }
 
 /* Initiates a raw socket and returns a valid socket or exits the program with an error message */
-int init_socket(struct timeval *recv_timeout, struct sockaddr *whereto, socklen_t *whereto_len) {
+int init_socket(int ip_ttl, struct timeval *recv_timeout, struct sockaddr *whereto, socklen_t *whereto_len) {
     int sockfd;
     int status;
     struct addrinfo hints, *servinfo, *p;
@@ -171,6 +175,13 @@ int init_socket(struct timeval *recv_timeout, struct sockaddr *whereto, socklen_
             continue;
         }
 
+        if (ip_ttl != -1) {
+            status = setsockopt(sockfd, IPPROTO_IP, IP_TTL, &ip_ttl, sizeof(ip_ttl));;
+            if (status != 0) {
+                perror("myping: socket: set ttl\n");
+                continue;
+            }
+        }
         // set timeout for recvfrom
         status = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *) recv_timeout, sizeof(struct timeval));
         if (status != 0) {
@@ -227,15 +238,17 @@ float update_stats(struct RTT_time *rtt_time_stats, struct timeval *recv_time, s
     return rtt;
 }
 
-void sigint_print_stats(int sig_num) {
+void exit_with_stats(int sig_num) {
     /* Note: no need to reset the signal since we are exiting the program */
-    printf("--- %s myping statistics ---\n", host);
+    printf("\n--- %s myping statistics ---\n", host);
     printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n", ntransmitted, nreceived,
            (ntransmitted - nreceived) * 100.0 / ntransmitted);
-    printf("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms", rtt_time_stats.min,
-           rtt_time_stats.sum / rtt_time_stats.cnt,
-           rtt_time_stats.max,
-           sqrt((rtt_time_stats.sumsq - rtt_time_stats.sum) / rtt_time_stats.cnt));
+
+    if (nreceived != 0)
+        printf("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms", rtt_time_stats.min,
+               rtt_time_stats.sum / rtt_time_stats.cnt,
+               rtt_time_stats.max,
+               sqrt((rtt_time_stats.sumsq - rtt_time_stats.sum) / rtt_time_stats.cnt));
     exit(0);
 }
 
@@ -282,7 +295,42 @@ int icmp_is_valid_reply(char *packet) {
     return 0;
 }
 
+static void exit_with_usage() {
+    fprintf(stderr, "usage: ./ping [-m TTL] [-t timeout] [-c count] host\n\n");
+    exit(1);
+}
 
-void print_usage() {
-    fprintf(stderr, "usage: ./ping host\n\n");
+void parse_args(int argc, char **argv, int *ttl, int *timeout, int *count) {
+    int c;
+    while ((c = getopt(argc, argv, "m:t:c:")) != -1) {
+        switch (c) {
+            case 'm':
+                *ttl = atoi(optarg);
+                if (*ttl <= 0) {
+                    fprintf(stderr, "./ping: invalid TTL: `%s'\n", optarg);
+                    exit_with_usage();
+                }
+                break;
+            case 't':
+                *timeout = atoi(optarg);
+                if (*timeout <= 0) {
+                    fprintf(stderr, "./ping: invalid timeout: `%s'\n", optarg);
+                    exit_with_usage();
+                }
+                break;
+            case 'c':
+                *count = atoi(optarg);
+                if (*count <= 0) {
+                    fprintf(stderr, "./ping: invalid count: `%s'\n", optarg);
+                    exit_with_usage();
+                }
+                break;
+            default:
+                exit_with_usage();
+                break;
+        }
+    }
+    if (optind >= argc) exit_with_usage();
+    host = argv[optind];
+    printf("args: ttl %d, timeout  %d count %d", *ttl, *timeout, *count);
 }
