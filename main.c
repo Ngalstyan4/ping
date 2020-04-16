@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
 
     // for received packets
     struct sockaddr wherefrom;
-    socklen_t wherefrom_len;
+    socklen_t wherefrom_len = sizeof(wherefrom);
 
     int status;
 
