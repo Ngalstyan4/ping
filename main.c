@@ -105,20 +105,26 @@ int main(int argc, char** argv) {
         compose_packet(packet, seq_num++);
         status = sendto(sockfd, packet, 16, 0, &whereto, whereto_len);//todo fix hardcoded 16
         if (status == -1) {
-            printf("unable to send to %s\n", inet_ntoa(((struct sockaddr_in *) &whereto)->sin_addr));
+            printf("sendto: unable to send to %s, icmp_seq=%u never sent\n", inet_ntoa(((struct sockaddr_in *) &whereto)->sin_addr), seq_num-1);
             sleep(wait);
+            // looks like regular ping does not continue here and tried to receive the packet with icmp_seq
+            // even if it never got sent. I think there is no point of that and so will continue here.
             continue;
         }
 
-        status = recvfrom(sockfd, packet, sizeof(packet), 0, &wherefrom, &wherefrom_len);
-        ip_header = (struct ip*)packet;
-        icmp_header = (struct icmp*)(packet + sizeof(struct ip));
+        // ignore received packets if we have already announced them as lost
+        do {
+            status = recvfrom(sockfd, packet, sizeof(packet), 0, &wherefrom, &wherefrom_len);
+            ip_header = (struct ip *) packet;
+            icmp_header = (struct icmp *) (packet + sizeof(struct ip));
+//            printf("receiving in header: %u , seq-1: %u", icmp_header->icmp_seq, seq_num-1);
+        } while(status != -1 && icmp_header->icmp_seq < seq_num-1);
 
         if (status != -1 && icmp_header->icmp_id == ICMP_ID) {
             printf("received icmp packet of %d bytes from %s, icmp_seq=%u \n", status,
                    inet_ntoa(((struct sockaddr_in *) &wherefrom)->sin_addr), icmp_header->icmp_seq);
         } else {
-            fprintf(stderr, "Request timeout for icmp_seq %u\n", seq_num);
+            fprintf(stderr, "Request timeout for icmp_seq %u\n", seq_num-1);
         }
         sleep(wait);
 

@@ -1,4 +1,8 @@
 
-all:
+all: build run
+
+build:
 	gcc main.c -o ping
-	sudo ./ping google.com
+
+run:
+	sudo ./ping am.am
