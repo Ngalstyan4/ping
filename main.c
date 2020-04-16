@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h> // for close(sockfd), sleep(t)
@@ -11,21 +12,28 @@
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 
+#define ICMP_HEADER_SIZE 8
 typedef struct RTT_time {
+    //// times in millis
     float min;
-    float avg;
     float max;
-    float stdev;
+    float sum;
+    float sumsq;
+    int cnt;
 } RTT_time;
 
 u_short ICMP_ID;
 
-void compose_packet(char *packet, u_short seq_num);
+
+int compose_packet(char *packet, u_short seq_num, struct timeval *send_time);
+
+float update_stats(struct RTT_time *rtt_time_stats, struct timeval *recv_time, struct timeval *send_time_in_data);
 
 u_short icmp_checksum(char *packet, int len);
 
 void print_usage();
-int main(int argc, char** argv) {
+
+int main(int argc, char **argv) {
     char packet[64];
     struct addrinfo hints, *servinfo, *p;
 
@@ -50,8 +58,8 @@ int main(int argc, char** argv) {
     // initial value relevant only for the first packet
     // then it is updated to 2*RTT //todo
     struct timeval recv_timeout = {1, 0};
-
-    RTT_time rtt_time = {0.0,0.0,0.0,0.0};
+    // sine we timeout at 1s, 2020ms is more than enough for init min value.
+    RTT_time rtt_time_stats = {.min=2020., .max=0.0, .sum=0.0, .sumsq=0.0, .cnt=0};
     int seq_num = 0;
     if (argc < 2 || argc > 2) {
         print_usage();
@@ -77,7 +85,7 @@ int main(int argc, char** argv) {
         }
 
         // set timeout for recvfrom
-        status = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recv_timeout, sizeof recv_timeout);
+        status = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &recv_timeout, sizeof recv_timeout);
         if (status != 0) {
             perror("client: socket: set recv timeout\n");
             continue;
@@ -96,35 +104,46 @@ int main(int argc, char** argv) {
 
     printf("myPING %s (%s):\n", host, inet_ntoa(((struct sockaddr_in *) &whereto)->sin_addr));
     seq_num = 0;
-    for(;;) {
+    for (;;) {
         struct icmp *icmp_header;
-        struct ip   *ip_header;
+        struct ip *ip_header;
+        struct timeval send_time, recv_time;
+        int size;
 
         // seq num can overflow but it is not that critical and we can hope it just wraps around
         // could do modulo arithmetic but thought it would be an overkill
-        compose_packet(packet, seq_num++);
-        status = sendto(sockfd, packet, 16, 0, &whereto, whereto_len);//todo fix hardcoded 16
+        gettimeofday(&send_time, NULL);
+        size = compose_packet(packet, seq_num++, &send_time);
+        status = sendto(sockfd, packet, size, 0, &whereto, whereto_len);//todo fix hardcoded 16
         if (status == -1) {
-            printf("sendto: unable to send to %s, icmp_seq=%u never sent\n", inet_ntoa(((struct sockaddr_in *) &whereto)->sin_addr), seq_num-1);
+            printf("sendto: unable to send to %s, icmp_seq=%u never sent\n",
+                   inet_ntoa(((struct sockaddr_in *) &whereto)->sin_addr), seq_num - 1);
             sleep(wait);
-            // looks like regular ping does not continue here and tried to receive the packet with icmp_seq
-            // even if it never got sent. I think there is no point of that and so will continue here.
+            /* looks like regular ping does not continue here and tried to receive the packet with icmp_seq
+             * even if it never got sent. I think there is no point of that and so will continue here.
+             */
             continue;
         }
 
-        // ignore received packets if we have already announced them as lost
+        /* ignore received packets if we have already announced them as lost */
         do {
             status = recvfrom(sockfd, packet, sizeof(packet), 0, &wherefrom, &wherefrom_len);
+            // could reuse send_time if desperate for space, but this is clearer
+            gettimeofday(&recv_time, NULL);
             ip_header = (struct ip *) packet;
             icmp_header = (struct icmp *) (packet + sizeof(struct ip));
-//            printf("receiving in header: %u , seq-1: %u", icmp_header->icmp_seq, seq_num-1);
-        } while(status != -1 && icmp_header->icmp_seq < seq_num-1);
+            //printf("receiving in header: %u , seq-1: %u", icmp_header->icmp_seq, seq_num-1);
+        } while (status != -1 && icmp_header->icmp_seq < seq_num - 1);
 
         if (status != -1 && icmp_header->icmp_id == ICMP_ID) {
-            printf("received icmp packet of %d bytes from %s, icmp_seq=%u \n", status,
-                   inet_ntoa(((struct sockaddr_in *) &wherefrom)->sin_addr), icmp_header->icmp_seq);
+            float rtt;
+
+            struct timeval *send_time_in_data = (struct timeval *) (packet + sizeof(struct ip) + ICMP_HEADER_SIZE);
+            rtt = update_stats(&rtt_time_stats, &recv_time, send_time_in_data);
+            printf("received icmp packet of %d bytes from %s, icmp_seq=%u time=%.3fms \n", status,
+                   inet_ntoa(((struct sockaddr_in *) &wherefrom)->sin_addr), icmp_header->icmp_seq, rtt);
         } else {
-            fprintf(stderr, "Request timeout for icmp_seq %u\n", seq_num-1);
+            fprintf(stderr, "Request timeout for icmp_seq %u\n", seq_num - 1);
         }
         sleep(wait);
 
@@ -133,26 +152,42 @@ int main(int argc, char** argv) {
 
 }
 
-
-void compose_packet(char *packet, u_short seq_num) {
-    char *message = "HAHAHAH";
+/* Compose ICMP message in packet and return its size (includes header and data) */
+int compose_packet(char *packet, u_short seq_num, struct timeval *send_time) {
     // struct icmp is much larger and contains more than just the header
     // but all we need is icmp header and first 8 bytes in the struct correspond to this
     struct icmp *icmp_header = (struct icmp *) packet;
-    char *time_val = packet + 8;
-    int i;
-    for (i = 0; i < 8; i++) {
-        time_val[i] = message[i];
-    }
+    struct timeval *time_val = (struct timeval *) (packet + 8);
+    *time_val = *send_time;
 
     icmp_header->icmp_type = ICMP_ECHO;
     icmp_header->icmp_code = 0;
     icmp_header->icmp_cksum = 0;
     icmp_header->icmp_seq = seq_num;
     icmp_header->icmp_id = ICMP_ID;        /* PID */
-    icmp_header->icmp_cksum = icmp_checksum(packet, 8 + sizeof(message));
+    icmp_header->icmp_cksum = icmp_checksum(packet, ICMP_HEADER_SIZE + sizeof(struct timeval));
+    return ICMP_HEADER_SIZE + sizeof(struct timeval);
 }
 
+
+float update_stats(struct RTT_time *rtt_time_stats, struct timeval *recv_time, struct timeval *send_time_in_data) {
+    float rtt;
+    rtt = recv_time->tv_sec - send_time_in_data->tv_sec;
+    rtt *= 1000000;
+    // not sure if negative result below is always defined, but works in my environment
+    rtt += recv_time->tv_usec - send_time_in_data->tv_usec;
+    // back to millis
+    rtt /= 1000;
+    rtt_time_stats->sum += rtt;
+    rtt_time_stats->sumsq += rtt * rtt;
+    rtt_time_stats->cnt++;
+    if (rtt < rtt_time_stats->min)
+        rtt_time_stats->min = rtt;
+    if (rtt > rtt_time_stats->max)
+        rtt_time_stats->max = rtt;
+    return rtt;
+
+}
 
 // https://tools.ietf.org/html/rfc1071
 // Computing the Internet Checksum
