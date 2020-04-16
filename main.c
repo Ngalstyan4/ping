@@ -12,6 +12,9 @@
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 
+#include <signal.h>
+#include <math.h>
+
 #define ICMP_HEADER_SIZE 8
 typedef struct RTT_time {
     //// times in millis
@@ -22,6 +25,13 @@ typedef struct RTT_time {
     int cnt;
 } RTT_time;
 
+/* These need to be global so the signal handler can access
+ */
+char *host;
+int ntransmitted = 0, nreceived = 0;
+/* sine we timeout at 1s, 2020ms is more than enough for init min value.*/
+RTT_time rtt_time_stats = {.min=2020., .max=0.0, .sum=0.0, .sumsq=0.0, .cnt=0};
+
 u_short ICMP_ID;
 
 
@@ -29,6 +39,7 @@ int compose_packet(char *packet, u_short seq_num, struct timeval *send_time);
 
 float update_stats(struct RTT_time *rtt_time_stats, struct timeval *recv_time, struct timeval *send_time_in_data);
 
+void sigint_print_stats(int sig_num);
 u_short icmp_checksum(char *packet, int len);
 
 void print_usage();
@@ -46,8 +57,6 @@ int main(int argc, char **argv) {
     socklen_t wherefrom_len = sizeof(wherefrom);
 
     int status;
-
-    char *host;
     int ret, sockfd;
     struct icmp *icmp;
 
@@ -58,8 +67,7 @@ int main(int argc, char **argv) {
     // initial value relevant only for the first packet
     // then it is updated to 2*RTT //todo
     struct timeval recv_timeout = {1, 0};
-    // sine we timeout at 1s, 2020ms is more than enough for init min value.
-    RTT_time rtt_time_stats = {.min=2020., .max=0.0, .sum=0.0, .sumsq=0.0, .cnt=0};
+
     int seq_num = 0;
     if (argc < 2 || argc > 2) {
         print_usage();
@@ -104,6 +112,7 @@ int main(int argc, char **argv) {
 
     printf("myPING %s (%s):\n", host, inet_ntoa(((struct sockaddr_in *) &whereto)->sin_addr));
     seq_num = 0;
+    signal(SIGINT, sigint_print_stats);
     for (;;) {
         struct icmp *icmp_header;
         struct ip *ip_header;
@@ -124,6 +133,7 @@ int main(int argc, char **argv) {
              */
             continue;
         }
+        ntransmitted++;
 
         /* ignore received packets if we have already announced them as lost */
         do {
@@ -137,8 +147,9 @@ int main(int argc, char **argv) {
 
         if (status != -1 && icmp_header->icmp_id == ICMP_ID) {
             float rtt;
-
             struct timeval *send_time_in_data = (struct timeval *) (packet + sizeof(struct ip) + ICMP_HEADER_SIZE);
+
+            nreceived++;
             rtt = update_stats(&rtt_time_stats, &recv_time, send_time_in_data);
             printf("received icmp packet of %d bytes from %s, icmp_seq=%u time=%.3fms \n", status,
                    inet_ntoa(((struct sockaddr_in *) &wherefrom)->sin_addr), icmp_header->icmp_seq, rtt);
@@ -185,9 +196,19 @@ float update_stats(struct RTT_time *rtt_time_stats, struct timeval *recv_time, s
         rtt_time_stats->min = rtt;
     if (rtt > rtt_time_stats->max)
         rtt_time_stats->max = rtt;
-    return rtt;
 
+    return rtt;
 }
+
+void sigint_print_stats(int sig_num) {
+    printf("---%s myping statistics ---\n", host);
+    printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n", ntransmitted, nreceived, (ntransmitted-nreceived) * 100.0/ntransmitted);
+    printf("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms", rtt_time_stats.min, rtt_time_stats.sum/rtt_time_stats.cnt,
+            rtt_time_stats.max,
+           sqrt((rtt_time_stats.sumsq-rtt_time_stats.sum)/rtt_time_stats.cnt));
+    exit(0);
+}
+
 
 // https://tools.ietf.org/html/rfc1071
 // Computing the Internet Checksum
