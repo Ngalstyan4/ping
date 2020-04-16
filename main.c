@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
 
     // timeout in (seconds, useconds)
     // initial value relevant only for the first packet
-    // then it is updated to 2*RTT //todo
+    // then it is updated to 2*RTT
     struct timeval recv_timeout = {1, 0};
     // seconds to wait after each request
     unsigned int interrequest_wait = 1;
@@ -245,7 +245,7 @@ void exit_with_stats(int sig_num) {
            (ntransmitted - nreceived) * 100.0 / ntransmitted);
 
     if (nreceived != 0)
-        printf("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms", rtt_time_stats.min,
+        printf("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n", rtt_time_stats.min,
                rtt_time_stats.sum / rtt_time_stats.cnt,
                rtt_time_stats.max,
                sqrt((rtt_time_stats.sumsq - rtt_time_stats.sum) / rtt_time_stats.cnt));
@@ -330,7 +330,6 @@ void parse_args(int argc, char **argv, int *ttl, int *timeout, int *count) {
                 break;
         }
     }
-    if (optind >= argc) exit_with_usage();
+    if (optind != argc-1) exit_with_usage();
     host = argv[optind];
-    printf("args: ttl %d, timeout  %d count %d", *ttl, *timeout, *count);
 }
