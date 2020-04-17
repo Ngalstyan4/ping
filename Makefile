@@ -4,9 +4,7 @@ PING = ping
 
 
 # -lm is needed to link libm.so on linux
-build: $(PING)
-
-$(PING):
+$(PING): main.c
 	$(CC) $(CFLAGS) main.c -o $(PING) -lm
 
 run: $(PING)

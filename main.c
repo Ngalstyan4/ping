@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <unistd.h> // for close(sockfd), sleep(t)
 #include <netdb.h>
+#include <errno.h>
 
 #include <netinet/in_systm.h>
 #include <netinet/in.h>
@@ -171,6 +172,13 @@ int init_socket(int ip_ttl, struct timeval *recv_timeout, struct sockaddr *where
     for (p = servinfo; p != NULL; p = p->ai_next) {
         //printf("socket, ai soctype %d %d", SOCK_RAW, hints.ai_socktype);
         if ((sockfd = socket(p->ai_family, SOCK_RAW, IPPROTO_ICMP)) == -1) {
+            if (EPERM == errno) {
+                fprintf(stderr, "myping: Operation not permitted\n"
+                                "Hint: myping needs to create raw sockets which often require superuser privileges\n"
+                                "please re-run the binary with elevated privileges\n"
+                                "sudo ./ping\n");
+                exit(1);
+            }
             perror("myping: socket\n");
             continue;
         }
@@ -330,6 +338,6 @@ void parse_args(int argc, char **argv, int *ttl, int *timeout, int *count) {
                 break;
         }
     }
-    if (optind != argc-1) exit_with_usage();
+    if (optind != argc - 1) exit_with_usage();
     host = argv[optind];
 }
