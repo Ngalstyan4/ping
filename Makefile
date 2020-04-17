@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS =
-PING = ping
+PING = ./ping
 
 
 # -lm is needed to link libm.so on linux
@@ -17,3 +17,11 @@ testgen: tests.sh
 
 tests.sh: testgen.py
 	python testgen.py > tests.sh
+
+setuidlinux:
+	sudo chown root:root $(PING)
+	sudo chmod u+s $(PING)
+
+setuidmac:
+	sudo chown root:wheel $(PING)
+	sudo chmod u+s $(PING)

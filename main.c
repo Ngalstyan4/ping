@@ -49,13 +49,16 @@ void exit_with_stats(int sig_num);
 
 u_short icmp_checksum(char *packet, int len);
 
-int icmp_is_valid_reply(char *packet);
+int icmp_is_valid_reply(char *packet, int seq_num);
+
+void ip_handle_if_timexceed(char *packet, int size);
 
 void parse_args(int argc, char **argv, int *ttl, int *timeout, int *count);
 
 int main(int argc, char **argv) {
-    // 20(ip header) + 8(ICMP header) + 16(timestamp)
-    char packet[sizeof(struct ip) + ICMP_HEADER_SIZE + sizeof(struct timeval)];
+    // echo reply:     20(ip header) + 8(ICMP header) + 16(timestamp)
+    // time exceeded:  20(ip header) + 8(ICMP header) + 20(orig ip header) + 8 (8 bits of orig data)
+    char packet[sizeof(struct ip) + ICMP_HEADER_SIZE + sizeof(struct ip) + ICMP_HEADER_SIZE];
 
     // for time data in sent and received packets
     struct sockaddr whereto;
@@ -85,7 +88,7 @@ int main(int argc, char **argv) {
     sockfd = init_socket(ip_ttl, &recv_timeout, &whereto, &whereto_len);
 
     printf("myPING %s (%s):\n", host, inet_ntoa(((struct sockaddr_in *) &whereto)->sin_addr));
-    // handle cmd+c to print stats before exit
+    // handle cmd+c to print stats before exit. Just move along if these error and we are unable to catch the signals
     signal(SIGINT, exit_with_stats);
     signal(SIGALRM, exit_with_stats);
     if (timeout != -1) alarm(timeout);
@@ -119,12 +122,17 @@ int main(int argc, char **argv) {
             status = recvfrom(sockfd, packet, sizeof(packet), 0, &wherefrom, &wherefrom_len);
             // could reuse send_time if desperate for space, but this is clearer
             gettimeofday(&recv_time, NULL);
+
+            ip_handle_if_timexceed(packet, status);
+
+            // packet must be at least 44 bytes. If it is not, there was an error
+            if (status < sizeof(struct ip) + ICMP_HEADER_SIZE + sizeof(struct timeval)) continue;
             ip_header = (struct ip *) packet;
             icmp_header = (struct icmp *) (packet + sizeof(struct ip));
             //printf("receiving in header: %u , seq-1: %u", icmp_header->icmp_seq, seq_num-1);
-        } while (status != -1 && icmp_header->icmp_seq < seq_num - 1);
+        } while (status != -1 && icmp_is_valid_reply((char *) icmp_header, seq_num) == -1);
 
-        if (status != -1 && icmp_is_valid_reply((char *) icmp_header) != -1) {
+        if (status != -1) {
             float rtt;
             struct timeval *send_time_in_data = (struct timeval *) (packet + sizeof(struct ip) + ICMP_HEADER_SIZE);
 
@@ -170,7 +178,6 @@ int init_socket(int ip_ttl, struct timeval *recv_timeout, struct sockaddr *where
     }
 
     for (p = servinfo; p != NULL; p = p->ai_next) {
-        //printf("socket, ai soctype %d %d", SOCK_RAW, hints.ai_socktype);
         if ((sockfd = socket(p->ai_family, SOCK_RAW, IPPROTO_ICMP)) == -1) {
             if (EPERM == errno) {
                 fprintf(stderr, "myping: Operation not permitted\n"
@@ -247,7 +254,9 @@ float update_stats(struct RTT_time *rtt_time_stats, struct timeval *recv_time, s
 }
 
 void exit_with_stats(int sig_num) {
-    /* Note: no need to reset the signal since we are exiting the program */
+    // Remove signal handlers to make sure the other handler does not call it while we are already here
+    signal(SIGINT, SIG_DFL);
+    signal(SIGALRM, SIG_DFL);
     printf("\n--- %s myping statistics ---\n", host);
     printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n", ntransmitted, nreceived,
            (ntransmitted - nreceived) * 100.0 / ntransmitted);
@@ -290,17 +299,49 @@ u_short icmp_checksum(char *packet, int len) {
     return checksum;
 }
 
-int icmp_is_valid_reply(char *packet) {
+int icmp_is_valid_reply(char *packet, int seq_num) {
     u_short checksum;
     struct icmp *icmp_header = (struct icmp *) packet;
     if (icmp_header->icmp_type != ICMP_ECHOREPLY) return -1;
     if (icmp_header->icmp_id != ICMP_ID) return -1;
+    if (icmp_header->icmp_seq < seq_num - 1) return -1;
 
     checksum = icmp_header->icmp_cksum;
     icmp_header->icmp_cksum = 0;
     icmp_header->icmp_cksum = icmp_checksum(packet, ICMP_HEADER_SIZE + sizeof(struct timeval));
     if (icmp_header->icmp_cksum != checksum) return -1;
+
     return 0;
+}
+
+void ip_handle_if_timexceed(char *packet, int size) {
+    u_short checksum;
+    struct ip *ip_header = (struct ip *) packet;
+    struct icmp *icmp_header = (struct icmp *) (packet + sizeof(struct ip));
+
+    /* struct icmp is larger than the header it represents hence using a const */
+    struct ip *nested_ip_header = (struct ip *) (packet + sizeof(struct ip) + ICMP_HEADER_SIZE);
+    struct icmp *nested_icmp_header = (struct icmp *) (packet + sizeof(struct ip) + ICMP_HEADER_SIZE +
+                                                       sizeof(struct ip));
+    if (size == -1) return;
+
+    checksum = icmp_header->icmp_cksum;
+    icmp_header->icmp_cksum = 0;
+    icmp_header->icmp_cksum = icmp_checksum((char *) icmp_header, size - sizeof(struct ip));
+
+    /*todo:: after hours of work still could not get the time exceeded message checksum to check out...*/
+    if (/* icmp_header->icmp_cksum == checksum && */
+            nested_icmp_header->icmp_id == ICMP_ID &&
+            icmp_header->icmp_type == ICMP_TIMXCEED &&
+            icmp_header->icmp_code == ICMP_TIMXCEED_INTRANS) {
+        printf("%d bytes from %s: Time to live exceeded \n", size, inet_ntoa(ip_header->ip_src));
+        printf("Src\t\tDst\n");
+        // N.B the next two need to be in separate lines since inet_ntoa uses a single static buffer
+        printf("%s\t", inet_ntoa(nested_ip_header->ip_src));
+        printf("%s\n", inet_ntoa(nested_ip_header->ip_dst));
+    }
+
+    icmp_header->icmp_cksum = checksum;
 }
 
 static void exit_with_usage() {
